@@ -19,7 +19,8 @@ class Parser:
             'students': "Номер в списке: ",
             'accepted_students': "Номер среди подавших согласие: ",
             'higher_priority': "Номер среди студентов с неменьшим приоритетом: ",
-            'higher_priority_accepted': "Неменьший приоритет и согласие: "
+            'higher_priority_accepted': "Неменьший приоритет и согласие: ",
+            'score': "Баллы: "
         }
 
     def load_html(self) -> None:
@@ -57,7 +58,8 @@ class Parser:
             'students': 0,
             'accepted_students': 0,
             'higher_priority': 0,
-            'higher_priority_accepted': 0
+            'higher_priority_accepted': 0,
+            'score': 0
         }
         priority_counter = {}
         accepted_priority_counter = {}
@@ -71,6 +73,7 @@ class Parser:
                     for priority in range(1, student_priority+1):
                         student_info['higher_priority'] += priority_counter[priority]
                         student_info['higher_priority_accepted'] += accepted_priority_counter[priority]
+                    student_info['score'] = int(row[5].text)
                     logging.info('Found information about student %d', person_number)
                     return student_info
                 else:
@@ -93,14 +96,15 @@ class Parser:
         """
         student_info = self.get_student_info(person_number)
         if len(student_info) == 0:
-            return "Информация о студенте не найдена"
+            student_info['Problem: '] = "Информация о студенте не найдена (скорее всего, его нет в данном списке или url некорректный)."
         
         headers = self.soup.select('h6')
         output_text = []
 
         for head in headers:
             output_text.append(head.text)
-        
+        output_text.append('\n')
+
         for key, value in student_info.items():
             output_text.append(f'{self._tech2readable.get(key, key)}{value}')
         logging.info("Formed output text for student %d", person_number)
