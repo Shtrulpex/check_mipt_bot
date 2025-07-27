@@ -115,7 +115,7 @@ class BotRuler:
     async def get_url_button(self, callback: types.CallbackQuery, state: FSMContext):
         """Обработчик кнопки получения URL."""
         try:
-            self.logger.info(f"User {callback.from_user.id} requested URL list.")
+            self.logger.info("User %s requested URL list.", callback.from_user.id)
             urls = self.db_worker.get_user_urls(callback.from_user.id)
             markup_urls = {}
             for data in urls:
@@ -134,7 +134,7 @@ class BotRuler:
             await callback.message.edit_text('\n'.join(out_text), reply_markup=markup)
             await state.set_state(Register.waiting_for_url)
         except Exception as e:
-            self.logger.error("Error in get_url_button for user_id=%s", user_id)
+            self.logger.error("Error in get_url_button for user_id=%s", callback.from_user.id)
             await callback.answer("Произошла ошибка при получении списка URL.")
 
     async def url_button_handler(self, callback: types.CallbackQuery, state: FSMContext):
