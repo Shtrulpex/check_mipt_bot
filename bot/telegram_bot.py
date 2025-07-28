@@ -26,8 +26,8 @@ class BotRuler:
         self.scheduler = AsyncIOScheduler()
         for i in range(9, 23):
             self.scheduler.add_job(self.update_parsers, 'cron', hour=i, minute=3)
-        self.scheduler.add_job(self.send_daily_message, 'cron', hour=10, minute=0)
-        self.scheduler.add_job(self.send_daily_message, 'cron', hour=23, minute=0)
+        self.scheduler.add_job(self.send_daily_message, 'cron', hour=10, minute=30)
+        self.scheduler.add_job(self.send_daily_message, 'cron', hour=22, minute=30)
         self.db_worker = db_worker
         self.parsers = {}
 
@@ -129,7 +129,7 @@ class BotRuler:
             markup = InlineKeyboardMarkup(
                 inline_keyboard=inline_keyboard
             )
-            out_text = ["Отслеживаемые списки:"]
+            out_text = ["Отслеживаемые списки (нажмите на кнопку с одним из них, чтобы удалить):"]
             out_text.extend([f"{i+1:02}: {markup_urls[url_id]}" for i, url_id in enumerate(markup_urls)])
             await callback.message.edit_text('\n'.join(out_text), reply_markup=markup)
             await state.set_state(Register.waiting_for_url)
@@ -142,7 +142,8 @@ class BotRuler:
             if callback.data == "back_to_menu":
                 self.logger.info("User %s returned to main menu.", callback.from_user.id)
                 await callback.message.edit_text(
-                    "Вы вернулись в главное меню.",
+                    "Привет! Я бот для получения информации о студентах.\n"
+                    "Нажмите одну из кнопок ниже, чтобы начать.",
                     reply_markup=self.standard_keyboard
                 )
                 await state.clear()
@@ -185,7 +186,7 @@ class BotRuler:
                 inline_keyboard=inline_keyboard
             )
 
-            await callback.message.edit_text("Отслеживаемые студенты, нажмите на того, которого надо удалить", reply_markup=markup)
+            await callback.message.edit_text("Отслеживаемые студенты (нажмите на одного из них, чтобы удалить", reply_markup=markup)
             await state.set_state(Register.waiting_for_student_number)
         except Exception as e:
             self.logger.error("Error in get_student_button for user_id=%s", callback.from_user.id)
@@ -196,7 +197,8 @@ class BotRuler:
             if callback.data == "back_to_menu":
                 self.logger.info("User %s returned to main menu.", callback.from_user.id)
                 await callback.message.edit_text(
-                    "Вы вернулись в главное меню.",
+                    "Привет! Я бот для получения информации о студентах.\n"
+                    "Нажмите одну из кнопок ниже, чтобы начать.",
                     reply_markup=self.standard_keyboard
                 )
                 await state.clear()
@@ -232,6 +234,7 @@ class BotRuler:
                 for student_id, _, url_id in info:
                     if url_id in self.parsers:
                         student_info = self.parsers[url_id](int(student_id))
+                        self.logger.debug("User: %s Student %s info: %s", callback.from_user.id, student_id, student_info)
                         await callback.message.answer(
                             f"Информация о студенте {student_id}:\n{student_info}",
                         )
