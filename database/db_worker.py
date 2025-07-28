@@ -151,6 +151,7 @@ class DatabaseWorker:
                 JOIN user2url USING (user_id) 
                 JOIN urls USING (url_id)
                 WHERE user_id = %s
+                ORDER BY student_id, url_id
             """
             self.logger.debug(template, user_id)
             cur.execute(template, (user_id,))
@@ -198,6 +199,7 @@ class DatabaseWorker:
             template = """
                 SELECT student_id, user_id, url_id FROM users
                 JOIN user2url USING (user_id)
+                ORDER BY user_id, student_id, url_id
             """
             self.logger.debug(template)
             cur.execute(template)

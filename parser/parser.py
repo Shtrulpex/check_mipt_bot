@@ -13,8 +13,8 @@ class Parser:
         self._tech2readable = {
             'students': "Номер в списке: ",
             'accepted_students': "Номер среди подавших согласие: ",
-            'higher_priority': "Номер среди студентов с неменьшим приоритетом: ",
-            'higher_priority_accepted': "Неменьший приоритет и согласие: ",
+            'higher_priority': "Номер среди студентов с большим или таким же приоритетом: ",
+            'higher_priority_accepted': "Больший или такой же приоритет и согласие: ",
             'score': "Баллы: "
         }
         self.init_logger()
