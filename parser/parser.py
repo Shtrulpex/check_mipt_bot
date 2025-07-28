@@ -65,10 +65,10 @@ class Parser:
             self.url
         )
         student_info = {
-            'students': 0,
-            'accepted_students': 0,
-            'higher_priority': 0,
-            'higher_priority_accepted': 0,
+            'students': 1,
+            'accepted_students': 1,
+            'higher_priority': 1,
+            'higher_priority_accepted': 1,
             'score': 0
         }
         priority_counter = {}
