@@ -46,8 +46,9 @@ class BotRuler:
         self.parsers: dict[int, AdmissionsParser] = {}
         self.pending_parsers: dict[int, AdmissionsParser] = {}
         self.moscow_tz = ZoneInfo("Europe/Moscow")
-        self.admission_year = int(
-            os.getenv("ADMISSION_YEAR", str(datetime.now(self.moscow_tz).year))
+        configured_year = os.getenv("ADMISSION_YEAR")
+        self.admission_year = (
+            int(configured_year) if configured_year else datetime.now(self.moscow_tz).year
         )
         self.scheduler = AsyncIOScheduler(timezone=self.moscow_tz)
         for hour in range(9, 23):

@@ -18,14 +18,47 @@
 могут отличаться. После публикации конкурсных списков нужно добавить новое
 отслеживание с ID, показанным на странице `/rating/`.
 
-## Запуск
+## Запуск через Docker
+
+Требуются Docker Engine с Compose v2. Скопируйте пример конфигурации и замените
+`BOT_TOKEN` и `DB_PASSWORD`:
+
+```bash
+cp .env.example .env
+docker compose up -d --build
+```
+
+PostgreSQL запускается внутри Compose и не публикует порт на хост. Бот ждёт
+успешного healthcheck базы, после чего сам создаёт таблицы `sources` и
+`trackings`. Посмотреть состояние и логи:
+
+```bash
+docker compose ps
+docker compose logs -f bot
+docker compose exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+```
+
+Обычная остановка сохраняет базу в именованном volume:
+
+```bash
+docker compose down
+```
+
+Полный сброс проекта вместе с данными PostgreSQL выполняется отдельно. Команда
+необратимо удаляет отслеживания:
+
+```bash
+docker compose down -v
+```
+
+## Локальный запуск без Docker
 
 Требуются Python 3.11+ и чистая база PostgreSQL.
 
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 cp .env.example .env
 python3 main.py
 ```
@@ -38,14 +71,12 @@ python3 main.py
 - `ADMISSION_YEAR` — необязательный год кампании, по умолчанию текущий год по
   Москве.
 
-При первом запуске создаются таблицы `sources` и `trackings`. Старая схема БД
-не поддерживается и не мигрируется.
+Для локального запуска задайте `DB_HOST=localhost`. При первом запуске создаются
+таблицы `sources` и `trackings`. Старая схема БД не поддерживается и не
+мигрируется.
 
 ## Тесты
 
 ```bash
 pytest
 ```
-
-Docker пока не входит в проект. Все настройки уже передаются через окружение,
-поэтому контейнеризация не потребует изменения кода или модели данных.
