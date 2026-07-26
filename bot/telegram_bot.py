@@ -1,291 +1,290 @@
+from __future__ import annotations
+
+import asyncio
 import logging
 import os
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.context import FSMContext
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import Message
-from aiogram.filters import CommandStart, Command
-from aiogram.types import ForceReply, InlineKeyboardMarkup, InlineKeyboardButton
-import requests
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from parser.parser import Parser
+from database.db_worker import DatabaseWorker, Tracking
+from parser.parser import (
+    AdmissionsParser,
+    ParserError,
+    UnsupportedSourceError,
+    default_registry,
+    normalize_applicant_id,
+)
+
+
+MSU_PRESETS = {
+    "msu_vmk_submitted": ("МГУ ВМК — предварительный", "https://cpk.msu.ru/submitted/bachelor/dep_02"),
+    "msu_vmk_rating": ("МГУ ВМК — конкурсный", "https://cpk.msu.ru/rating/dep_02"),
+    "msu_math_submitted": ("МГУ мехмат — предварительный", "https://cpk.msu.ru/submitted/bachelor/dep_01"),
+    "msu_math_rating": ("МГУ мехмат — конкурсный", "https://cpk.msu.ru/rating/dep_01"),
+}
 
 
 class Register(StatesGroup):
-    waiting_for_student_number = State()
-    waiting_for_new_student_number = State()
-    waiting_for_url = State()
-    waiting_for_new_url = State()
+    waiting_for_custom_url = State()
+    waiting_for_applicant_id = State()
+
 
 class BotRuler:
-    def __init__(self, token, db_worker):
+    def __init__(self, token: str, db_worker: DatabaseWorker):
         self.bot = Bot(token=token)
         self.dp = Dispatcher()
-        self.scheduler = AsyncIOScheduler()
-        for i in range(9, 23):
-            self.scheduler.add_job(self.update_parsers, 'cron', hour=i, minute=3)
-        self.scheduler.add_job(self.send_daily_message, 'cron', hour=10, minute=30)
-        self.scheduler.add_job(self.send_daily_message, 'cron', hour=22, minute=30)
         self.db_worker = db_worker
-        self.parsers = {}
+        self.registry = default_registry()
+        self.logger = logging.getLogger(__name__)
+        self.parsers: dict[int, AdmissionsParser] = {}
+        self.pending_parsers: dict[int, AdmissionsParser] = {}
+        self.moscow_tz = ZoneInfo("Europe/Moscow")
+        self.admission_year = int(
+            os.getenv("ADMISSION_YEAR", str(datetime.now(self.moscow_tz).year))
+        )
+        self.scheduler = AsyncIOScheduler(timezone=self.moscow_tz)
+        for hour in range(9, 23):
+            self.scheduler.add_job(self.update_parsers, "cron", hour=hour, minute=3)
+        self.scheduler.add_job(self.send_daily_message, "cron", hour=10, minute=30)
+        self.scheduler.add_job(self.send_daily_message, "cron", hour=22, minute=30)
 
-        for id, url in self.db_worker.get_urls():
-            self.parsers[id] = Parser(url)
+        for source in self.db_worker.get_sources():
+            try:
+                self.parsers[source.id] = self.registry.create(
+                    source.url, load=False, expected_year=self.admission_year
+                )
+            except UnsupportedSourceError:
+                self.logger.warning("Ignoring unsupported persisted source: %s", source.url)
 
         self.standard_keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="URLs", callback_data="urls"),
-                InlineKeyboardButton(text="Студенты", callback_data="student_number")],
-                [InlineKeyboardButton(text="Всю информацию прямо сейчас", callback_data="give_info_now")]
+                [InlineKeyboardButton(text="Отслеживания", callback_data="trackings")],
+                [InlineKeyboardButton(text="Вся информация сейчас", callback_data="give_info_now")],
             ]
         )
 
         self.dp.message.register(self.main_command, CommandStart())
         self.dp.message.register(self.main_command, Command("menu"))
-        self.dp.message.register(self.handle_new_url, Register.waiting_for_new_url)
-        self.dp.message.register(self.handle_new_student, Register.waiting_for_new_student_number)
-        self.dp.callback_query.register(self.url_button_handler, Register.waiting_for_url)
-        self.dp.callback_query.register(self.student_button_handler, Register.waiting_for_student_number)
+        self.dp.message.register(self.handle_custom_url, Register.waiting_for_custom_url)
+        self.dp.message.register(self.handle_applicant_id, Register.waiting_for_applicant_id)
         self.dp.callback_query.register(self.callback_handler)
-        self.init_logger()
-    
-    def init_logger(self) -> None:
-        self.logger = logging.getLogger(__name__)
-        self.logger.setLevel(logging.DEBUG)
-        
-        handler = logging.FileHandler(os.path.join(os.getenv("LOG_DIR"), 'bot.log'))
-        handler.setLevel(logging.DEBUG)
-        file_formatter = logging.Formatter('%(asctime)s | %(levelname)-8s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-        handler.setFormatter(file_formatter)
-        
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)
-        console_formatter = logging.Formatter('%(asctime)s | %(levelname)-8s | Bot:    %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-        console_handler.setFormatter(console_formatter)
-        
-        self.logger.addHandler(handler)
-        self.logger.addHandler(console_handler)
 
-    async def start_polling(self):
+    async def start_polling(self) -> None:
+        await self.update_parsers()
         self.scheduler.start()
         await self.dp.start_polling(self.bot)
 
-    async def update_parsers(self):
-        """Обновляет парсеры для всех URL."""
-        try:
-            self.logger.info("Updating parsers for all URLs.")
-            for k in self.parsers:
-                self.parsers[k].load_html()
-        except Exception as e:
-            self.logger.error("Error updating parsers: %s", str(e))
-
-    async def send_daily_message(self):
-        try:
-            self.logger.info("Sending daily message to all users.")
-            for student_id, user_id, url_id in self.db_worker.get_all_users_info():
-                if url_id in self.parsers:
-                    try:
-                        student_info = self.parsers[url_id](int(student_id))
-                        await self.bot.send_message(
-                            user_id,
-                            f"Информация о студенте {student_id}:\n{student_info}"
-                        )
-                    except Exception as e:
-                        self.logger.error("Error getting info for student %s and url %s: %s", student_id, self.parsers[url_id].url, str(e))
-                        await self.bot.send_message(
-                            user_id,
-                            f"Не удалось получить информацию о студенте {student_id}. Проверьте URL {self.parsers[url_id].url}."
-                        )
-            self.logger.info("Sending finished successfully.")
-        except Exception as e:
-            self.logger.error("Error sending daily message: %s", str(e))
-    
-    async def main_command(self, message: Message, state: FSMContext):
-        """Обработчик команды /start, /menu"""
-        self.logger.info("User %s went to menu.", message.from_user.id)
-        await state.clear()  # Очистка состояния перед началом
-        await message.answer(
-            "Привет! Я бот для получения информации о студентах.\n"
-            "Нажмите одну из кнопок ниже, чтобы начать.",
-            reply_markup=self.standard_keyboard
+    async def update_parsers(self) -> None:
+        if not self.parsers:
+            return
+        self.logger.info("Refreshing %d admissions sources", len(self.parsers))
+        source_ids = list(self.parsers)
+        outcomes = await asyncio.gather(
+            *(asyncio.to_thread(self.parsers[source_id].refresh) for source_id in source_ids),
+            return_exceptions=True,
         )
-    
-    async def get_url_button(self, callback: types.CallbackQuery, state: FSMContext):
-        """Обработчик кнопки получения URL."""
-        try:
-            self.logger.info("User %s requested URL list.", callback.from_user.id)
-            urls = self.db_worker.get_user_urls(callback.from_user.id)
-            markup_urls = {}
-            for data in urls:
-                markup_urls[data[0]] = f'{data[1]}'
-            inline_keyboard = [
-                [InlineKeyboardButton(text=f'{i+1:02}: {markup_urls[url_id]}', callback_data=f"del_url_{url_id}")]
-                for i, url_id in enumerate(markup_urls)
-            ]
-            inline_keyboard.append([InlineKeyboardButton(text="Добавить новый URL", callback_data="add_new_url")])
-            inline_keyboard.append([InlineKeyboardButton(text="Назад", callback_data="back_to_menu")])
-            markup = InlineKeyboardMarkup(
-                inline_keyboard=inline_keyboard
-            )
-            out_text = ["Отслеживаемые списки (нажмите на кнопку с одним из них, чтобы удалить):"]
-            out_text.extend([f"{i+1:02}: {markup_urls[url_id]}" for i, url_id in enumerate(markup_urls)])
-            await callback.message.edit_text('\n'.join(out_text), reply_markup=markup)
-            await state.set_state(Register.waiting_for_url)
-        except Exception as e:
-            self.logger.error("Error in get_url_button for user_id=%s", callback.from_user.id)
-            await callback.answer("Произошла ошибка при получении списка URL.")
+        for source_id, outcome in zip(source_ids, outcomes):
+            parser = self.parsers[source_id]
+            if outcome is True:
+                self.db_worker.update_source_title(source_id, parser.title)
+            elif isinstance(outcome, Exception):
+                self.logger.error("Refresh failed for %s: %s", parser.url, outcome)
+            else:
+                self.logger.warning("Refresh failed for %s: %s", parser.url, parser.last_error)
 
-    async def url_button_handler(self, callback: types.CallbackQuery, state: FSMContext):
+    async def send_daily_message(self) -> None:
+        self.logger.info("Sending scheduled admissions reports")
+        for tracking in self.db_worker.get_all_trackings():
+            await self._send_tracking(tracking.user_id, tracking)
+
+    async def main_command(self, message: Message, state: FSMContext) -> None:
+        self.pending_parsers.pop(message.from_user.id, None)
+        await state.clear()
+        await message.answer(
+            "Бот отслеживает конкурсные списки по точной связке страницы и ID заявления.",
+            reply_markup=self.standard_keyboard,
+        )
+
+    async def callback_handler(self, callback: types.CallbackQuery, state: FSMContext) -> None:
+        data = callback.data or ""
         try:
-            if callback.data == "back_to_menu":
-                self.logger.info("User %s returned to main menu.", callback.from_user.id)
+            if data == "back_to_menu":
+                await callback.answer()
+                await state.clear()
+                self.pending_parsers.pop(callback.from_user.id, None)
                 await callback.message.edit_text(
-                    "Привет! Я бот для получения информации о студентах.\n"
-                    "Нажмите одну из кнопок ниже, чтобы начать.",
-                    reply_markup=self.standard_keyboard
+                    "Бот отслеживает конкурсные списки по точной связке страницы и ID заявления.",
+                    reply_markup=self.standard_keyboard,
                 )
-                await state.clear()
-            elif callback.data == "add_new_url":
-                self.logger.info("User %s requested to add a new URL.", callback.from_user.id)
-                await callback.answer(
-                    "Введите новый URL:",
-                    reply_markup=ForceReply(input_field_placeholder="Введите URL")
+            elif data == "trackings":
+                await callback.answer()
+                await self.show_trackings(callback, state)
+            elif data == "add_tracking":
+                await callback.answer()
+                await self.show_source_picker(callback, state)
+            elif data == "custom_source":
+                await callback.answer()
+                await state.set_state(Register.waiting_for_custom_url)
+                await callback.message.answer(
+                    "Пришлите полную ссылку на поддерживаемый конкурсный список:",
+                    reply_markup=ForceReply(input_field_placeholder="https://..."),
                 )
-                await state.set_state(Register.waiting_for_new_url)
-            elif callback.data.startswith("del_url_"):
-                url_id = int(callback.data.split("_")[2])
-                self.logger.info("User %s requested to delete a URL_%s", callback.from_user.id, url_id)
-                if self.db_worker.delete_url(url_id, callback.from_user.id):
-                    self.parsers.pop(url_id, None)
-                self.logger.info("URL %s deleted successfully for user %s.", url_id, callback.from_user.id)
-
-                await callback.answer("URL успешно удален!")
-                await self.get_url_button(callback, state)
+            elif data.startswith("preset_"):
+                await callback.answer("Проверяю страницу…")
+                preset_key = data.removeprefix("preset_")
+                await self._prepare_source(callback.from_user.id, MSU_PRESETS[preset_key][1], state, callback.message)
+            elif data.startswith("del_tracking_"):
+                await callback.answer()
+                tracking_id = int(data.removeprefix("del_tracking_"))
+                unused_source = self.db_worker.delete_tracking(tracking_id, callback.from_user.id)
+                if unused_source is not None:
+                    self.parsers.pop(unused_source, None)
+                await self.show_trackings(callback, state)
+            elif data == "give_info_now":
+                await callback.answer()
+                trackings = self.db_worker.get_user_trackings(callback.from_user.id)
+                if not trackings:
+                    await callback.message.answer("Сначала добавьте хотя бы одно отслеживание.")
+                for tracking in trackings:
+                    await self._send_tracking(callback.from_user.id, tracking)
             else:
-                self.logger.warning("Unknown callback data: %s", callback.data)
-        except Exception as e:
-            self.logger.error("Error in url_button_handler from user_id=%s", callback.from_user.id)
-            await callback.answer("Произошла внутренняя ошибка. Попробуйте позже.")
-    
-    async def get_student_button(self, callback: types.CallbackQuery, state: FSMContext):
-        """Обработчик кнопки получения student_id."""
-        try:
-            self.logger.info("User %s requested student list.", callback.from_user.id)
-            students = self.db_worker.get_user_student_ids(callback.from_user.id)
-
-            inline_keyboard = [
-                [InlineKeyboardButton(text=str(student_id[0]), callback_data=f"del_student_{student_id[0]}")]
-                for student_id in students
-            ]
-            self.logger.debug("Students found: %s", students)
-            inline_keyboard.append([InlineKeyboardButton(text="Добавить нового студента", callback_data="add_new_student")])
-            inline_keyboard.append([InlineKeyboardButton(text="Назад", callback_data="back_to_menu")])
-            markup = InlineKeyboardMarkup(
-                inline_keyboard=inline_keyboard
-            )
-
-            await callback.message.edit_text("Отслеживаемые студенты (нажмите на одного из них, чтобы удалить", reply_markup=markup)
-            await state.set_state(Register.waiting_for_student_number)
-        except Exception as e:
-            self.logger.error("Error in get_student_button for user_id=%s", callback.from_user.id)
-            await callback.answer("Произошла ошибка при получении списка студентов.")
-
-    async def student_button_handler(self, callback: types.CallbackQuery, state: FSMContext):
-        try:
-            if callback.data == "back_to_menu":
-                self.logger.info("User %s returned to main menu.", callback.from_user.id)
-                await callback.message.edit_text(
-                    "Привет! Я бот для получения информации о студентах.\n"
-                    "Нажмите одну из кнопок ниже, чтобы начать.",
-                    reply_markup=self.standard_keyboard
-                )
-                await state.clear()
-            elif callback.data == "add_new_student":
-                self.logger.info("User %s requested to add a new student.", callback.from_user.id)
-                await callback.answer(
-                    "Введите новый уникальный идентификатор студента:",
-                    reply_markup=ForceReply(input_field_placeholder="Введите уникальный идентификатор студента")
-                )
-                await state.set_state(Register.waiting_for_new_student_number)
-            elif callback.data.startswith("del_student_"):
-                student_id = int(callback.data.split("_")[2])
-                self.logger.info("User %s requested to delete student_%s", callback.from_user.id, student_id)
-                self.db_worker.delete_student_id(student_id, callback.from_user.id)
-                self.logger.info("Student %s deleted successfully for user %s.", student_id, callback.from_user.id)
-
-                await callback.answer("Студент успешно удален!")
-                await self.get_student_button(callback, state)
-        except Exception as e:
-            self.logger.error("Error in student_button_handler for user_id=%s", callback.from_user.id)
-            await callback.answer("Произошла внутренняя ошибка. Попробуйте позже.")
-    
-    async def callback_handler(self, callback: types.CallbackQuery, state: FSMContext):
-        try:
-            if callback.data == "urls":
-                await self.get_url_button(callback, state)
-            elif callback.data == "student_number":
-                await self.get_student_button(callback, state)
-            elif callback.data == "give_info_now":
-                self.logger.info("User %s requested information for all students.", callback.from_user.id)
-                info = self.db_worker.get_user_info(callback.from_user.id)
-                self.logger.debug("User %s info: %s", callback.from_user.id, info)
-                for student_id, _, url_id in info:
-                    if url_id in self.parsers:
-                        student_info = self.parsers[url_id](int(student_id))
-                        self.logger.debug("User: %s Student %s info: %s", callback.from_user.id, student_id, student_info)
-                        await callback.message.answer(
-                            f"Информация о студенте {student_id}:\n{student_info}",
-                        )
-                    else:
-                        await callback.message.answer(
-                            f"Нет информации для студента {student_id}.",
-                        )
-                if len(info) == 0:
-                    await callback.answer("Добавьте, пожалуйста студента и/или URL")
-        except Exception as e:
-            self.logger.error("Error in callback_handler for user_id=%s", callback.from_user.id)
-            await callback.answer("Произошла внутренняя ошибка. Попробуйте позже.")
-    
-    async def handle_new_url(self, message: Message, state: FSMContext):
-        """Обработчик ввода нового URL."""
-        try:
-            new_url = message.text.strip()
-            user_id = message.from_user.id
-            if self._is_url_accessible(new_url):
-                url_id = self.db_worker.add_url(new_url, user_id)
-                self.logger.info("User %s added new URL: %s with id %s", user_id, new_url, url_id)
-                if not url_id in self.parsers:
-                    self.parsers[url_id] = Parser(new_url)
-                await self.main_command(message, state)
-                await state.clear()
-            else:
-                await message.answer("Пожалуйста, введите корректный URL.")
-        except Exception as e:
-            self.logger.error("Error handling new URL from user_id=%s: %s", message.from_user.id, str(e))
-            await message.answer("Произошла ошибка при добавлении URL. Пожалуйста, попробуйте еще раз.")
-    
-    async def handle_new_student(self, message: Message, state: FSMContext):
-        """Обработчик ввода нового URL."""
-        try:
-            new_student_id = message.text.strip()
-            self.logger.info("User %s is adding a new student %s.", message.from_user.id, new_student_id)
-            user_id = message.from_user.id
-            if new_student_id.isdigit():
-                self.db_worker.add_user(new_student_id, user_id)
-                self.logger.info("User %s added student %s.", user_id, new_student_id)
-                await self.main_command(message, state)
-                await state.clear()
-            else:
-                await message.answer("Пожалуйста, введите корректный уникальный идентификатор студента.")
-        except Exception as e:
-            self.logger.error("Error handling new student from user_id=%s: %s", message.from_user.id, str(e))
-            await message.answer("Произошла ошибка при добавлении студента. Пожалуйста, попробуйте еще раз.")
-    
-    def _is_url_accessible(self, url: str) -> bool:
-        try:
-            response = requests.get(url, timeout=5, allow_redirects=True)
-            return response.status_code < 400
+                await callback.answer("Неизвестная команда")
+        except (ParserError, UnsupportedSourceError, KeyError) as exc:
+            self.logger.info("Cannot process source: %s", exc)
+            await callback.message.answer(f"Не удалось использовать страницу: {exc}")
         except Exception:
-            return False
+            self.logger.exception("Callback handling failed for user %s", callback.from_user.id)
+            await callback.message.answer("Произошла внутренняя ошибка. Попробуйте позже.")
+
+    async def show_trackings(self, callback: types.CallbackQuery, state: FSMContext) -> None:
+        await state.clear()
+        trackings = self.db_worker.get_user_trackings(callback.from_user.id)
+        buttons: list[list[InlineKeyboardButton]] = []
+        lines = ["Отслеживания (нажмите, чтобы удалить):"]
+        for index, tracking in enumerate(trackings, start=1):
+            title = tracking.title or tracking.provider.upper()
+            label = f"{index:02}. {title}: {tracking.applicant_id}"
+            buttons.append(
+                [InlineKeyboardButton(text=label[:60], callback_data=f"del_tracking_{tracking.id}")]
+            )
+            lines.append(label)
+        buttons.append([InlineKeyboardButton(text="Добавить", callback_data="add_tracking")])
+        buttons.append([InlineKeyboardButton(text="Назад", callback_data="back_to_menu")])
+        await callback.message.edit_text(
+            "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        )
+
+    async def show_source_picker(self, callback: types.CallbackQuery, state: FSMContext) -> None:
+        await state.clear()
+        buttons = [
+            [InlineKeyboardButton(text=label, callback_data=f"preset_{key}")]
+            for key, (label, _) in MSU_PRESETS.items()
+        ]
+        buttons.extend(
+            [
+                [InlineKeyboardButton(text="Другой URL", callback_data="custom_source")],
+                [InlineKeyboardButton(text="Назад", callback_data="trackings")],
+            ]
+        )
+        await callback.message.edit_text(
+            "Выберите список. Предварительный и конкурсный ID могут различаться.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+
+    async def handle_custom_url(self, message: Message, state: FSMContext) -> None:
+        await self._prepare_source(message.from_user.id, message.text or "", state, message)
+
+    async def _prepare_source(
+        self,
+        user_id: int,
+        url: str,
+        state: FSMContext,
+        target: Message,
+    ) -> None:
+        try:
+            parser = await asyncio.to_thread(
+                self.registry.create,
+                url,
+                load=True,
+                expected_year=self.admission_year,
+            )
+        except (ParserError, UnsupportedSourceError) as exc:
+            await target.answer(f"Не удалось использовать страницу: {exc}")
+            return
+        self.pending_parsers[user_id] = parser
+        await state.set_state(Register.waiting_for_applicant_id)
+        await target.answer(
+            f"Страница распознана: {parser.title}.\n"
+            "Введите ID, отображаемый именно на этой странице:",
+            reply_markup=ForceReply(input_field_placeholder="ID заявления"),
+        )
+
+    async def handle_applicant_id(self, message: Message, state: FSMContext) -> None:
+        applicant_id = normalize_applicant_id(message.text or "")
+        parser = self.pending_parsers.get(message.from_user.id)
+        if parser is None:
+            await state.clear()
+            await message.answer("Сессия добавления истекла. Начните ещё раз через меню.")
+            return
+        if not applicant_id or len(applicant_id) > 128 or not applicant_id.isprintable():
+            await message.answer("Введите непустой ID длиной не более 128 символов.")
+            return
+        found = parser.lookup(applicant_id)
+        if not found:
+            await message.answer(
+                "Такой ID не найден в основных бюджетных местах этой страницы. "
+                "Проверьте ID или пришлите другой."
+            )
+            return
+
+        _, source_id = self.db_worker.add_tracking(
+            parser.url, parser.provider, applicant_id, message.from_user.id
+        )
+        self.db_worker.update_source_title(source_id, parser.title)
+        self.parsers[source_id] = parser
+        self.pending_parsers.pop(message.from_user.id, None)
+        await state.clear()
+        await message.answer(
+            f"Отслеживание добавлено. Найдено конкурсных групп: {len(found)}."
+        )
+        await message.answer(
+            "Бот отслеживает конкурсные списки по точной связке страницы и ID заявления.",
+            reply_markup=self.standard_keyboard,
+        )
+
+    async def _send_tracking(self, user_id: int, tracking: Tracking) -> None:
+        parser = self.parsers.get(tracking.source_id)
+        if parser is None:
+            await self.bot.send_message(user_id, f"Источник для ID {tracking.applicant_id} недоступен.")
+            return
+        report = parser(tracking.applicant_id)
+        for chunk in self._split_message(report):
+            try:
+                await self.bot.send_message(user_id, chunk)
+            except Exception:
+                self.logger.exception("Cannot send report to user %s", user_id)
+                break
+
+    @staticmethod
+    def _split_message(text: str, limit: int = 4000) -> list[str]:
+        if len(text) <= limit:
+            return [text]
+        chunks: list[str] = []
+        current = ""
+        for block in text.split("\n\n"):
+            candidate = f"{current}\n\n{block}".strip()
+            if current and len(candidate) > limit:
+                chunks.append(current)
+                current = block
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+        return chunks
